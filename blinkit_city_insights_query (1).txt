@@ -1,0 +1,62 @@
+WITH base_data AS (
+  SELECT 
+    abcs.*,
+    bcm.city_name AS city,
+    bc.l1_category AS category_name,
+    bc.l2_category AS subcategory_name
+  FROM all_blinkit_category_scraping_stream abcs
+  JOIN blinkit_city_map bcm ON abcs.store_id = bcm.store_id
+  LEFT JOIN blinkit_categories bc
+    ON abcs.l1_category_id = bc.l1_category_id AND abcs.l2_category_id = bc.l2_category_id
+),
+ranked AS (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY store_id, sku_id ORDER BY created_at) AS rn
+  FROM base_data
+),
+deltas AS (
+  SELECT 
+    a.*,
+    b.inventory AS next_inventory,
+    b.created_at AS next_datetime,
+    CASE 
+      WHEN b.inventory < a.inventory THEN a.inventory - b.inventory
+      ELSE NULL
+    END AS est_qty_sold
+  FROM ranked a
+  LEFT JOIN ranked b
+    ON a.store_id = b.store_id AND a.sku_id = b.sku_id AND a.rn + 1 = b.rn
+),
+rolling_avg AS (
+  SELECT 
+    store_id,
+    sku_id,
+    created_at,
+    AVG(prev_sold) OVER (PARTITION BY store_id, sku_id ORDER BY created_at ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) AS avg_est_qty
+  FROM (
+    SELECT 
+      store_id,
+      sku_id,
+      created_at,
+      CASE WHEN inventory > LAG(inventory) OVER (PARTITION BY store_id, sku_id ORDER BY created_at)
+           THEN NULL
+           ELSE LAG(inventory) OVER (PARTITION BY store_id, sku_id ORDER BY created_at) - inventory
+      END AS prev_sold
+    FROM base_data
+  ) sub
+),
+final_output AS (
+  SELECT
+    d.created_at AS datetime,
+    d.city,
+    d.store_id,
+    d.sku_name AS sku,
+    d.selling_price AS price,
+    d.category_name,
+    d.subcategory_name,
+    COALESCE(d.est_qty_sold, r.avg_est_qty, 0) AS est_qty_sold
+  FROM deltas d
+  LEFT JOIN rolling_avg r
+    ON d.store_id = r.store_id AND d.sku_id = r.sku_id AND d.created_at = r.created_at
+)
+SELECT * FROM final_output;
